@@ -1,0 +1,33 @@
+# Binaries and build output
+bin/
+build/
+dist/
+*.exe
+*.out
+*.test
+
+# Coverage and profiling
+coverage.out
+coverage.html
+*.coverprofile
+*.prof
+
+# Go workspace/local files
+go.work
+go.work.sum
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+tmp/
+.tmp/
