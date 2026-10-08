@@ -39,25 +39,20 @@ func newVerifyAddressFlow() *trail.Definition[verifyAddressData, verifyAddressIn
 				Code:        in.Code,
 				ResendAfter: begin.Now.Add(time.Minute),
 			}
-			return &trail.Transition[verifyAddressData]{
-				State: "code_required",
-				Data:  data,
-				Public: map[string]any{
-					"state": "code_required",
-				},
-			}, nil
+			return trail.To("code_required", data).WithView(map[string]any{
+				"state": "code_required",
+			}), nil
 		},
 	)
 
-	trail.Start(spec).MustGoTo("code_required")
-	trail.When(spec,
-		"code_required",
+	spec.Start().MustGoTo("code_required")
+	spec.When("code_required",
 		func(_ context.Context, data verifyAddressData, action verifyCode) (*trail.Transition[verifyAddressData], error) {
 			if action.Code != data.Code {
 				return nil, errors.New("invalid code")
 			}
 			return trail.Done("verified", data).
-				WithPublic(map[string]any{
+				WithView(map[string]any{
 					"state": "verified",
 				}), nil
 		},

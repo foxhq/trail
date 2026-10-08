@@ -22,12 +22,13 @@ func cloneStringMap(in map[string]string) map[string]string {
 
 func cloneSnapshot(in Snapshot) Snapshot {
 	in.Data = cloneBytes(in.Data)
+	in.ViewData = cloneBytes(in.ViewData)
 	in.Metadata = cloneStringMap(in.Metadata)
 	return in
 }
 
 func cloneResult(in Result) Result {
-	in.Metadata = cloneStringMap(in.Metadata)
+	in.View = cloneBytes(in.View)
 	return in
 }
 

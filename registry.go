@@ -12,6 +12,14 @@ type SpecRegistry struct {
 	specs map[FlowType]erasedSpec
 }
 
+type definitionSealer interface {
+	seal()
+}
+
+type dataVersionSupport interface {
+	SupportsDataVersion(version int) bool
+}
+
 // NewRegistry creates an empty spec registry.
 func NewRegistry() *SpecRegistry {
 	return &SpecRegistry{
@@ -34,12 +42,18 @@ func Register[D any](r *SpecRegistry, spec Spec[D]) error {
 	if spec.DataVersion() <= 0 {
 		return fmt.Errorf("%w: data version must be positive", ErrInvalidFlow)
 	}
+	if versioned, ok := any(spec).(dataVersionSupport); ok && !versioned.SupportsDataVersion(spec.DataVersion()) {
+		return fmt.Errorf("%w: codec does not support data version %d", ErrUnsupportedDataVersion, spec.DataVersion())
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.specs[flowType]; exists {
 		return fmt.Errorf("%w: %s", ErrSpecAlreadyRegistered, flowType)
+	}
+	if sealable, ok := any(spec).(definitionSealer); ok {
+		sealable.seal()
 	}
 	r.specs[flowType] = eraseSpec(spec)
 	return nil

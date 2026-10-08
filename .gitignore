@@ -28,6 +28,9 @@ go.work.sum
 *.swp
 *.swo
 
+# Local agent state
+.serena/
+
 # Temporary files
 tmp/
 .tmp/

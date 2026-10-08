@@ -1,36 +1,28 @@
 # trail
 
-Typed, persistent workflows for Go.
+Typed, durable workflows for Go.
 
-Trail is for product flows that cannot finish in one request.
+Trail is for the part of your product that cannot be finished in one request: a sign-in challenge, onboarding, approval, checkout, provisioning, recovery, review, or long-running setup. Define its behavior as ordinary Go, save its progress, and resume it safely later.
 
-Start a flow, persist it, resume it later, and keep each step as normal typed Go code. It works well for onboarding, checkout, approvals, provisioning, account recovery, document review, subscription changes, and other flows where state matters.
+It gives a workflow a real shape: typed private data, explicit state transitions, a client-safe view, optimistic concurrency, and durable work that survives a commit. The application still owns its database, transactions, jobs, and delivery infrastructure.
 
-The goal is not to be a big workflow platform. Trail gives you the useful parts: typed handlers, durable snapshots, allowed transitions, retries, and effect publishing.
-
-Your application works with structs. Your database stores snapshots. Trail keeps the two sides in sync.
-
----
-
-## Table of contents
+## Contents
 
 - [Install](#install)
 - [A workflow in 30 seconds](#a-workflow-in-30-seconds)
-- [Why Trail exists](#why-trail-exists)
-- [Define behavior on structs](#define-behavior-on-structs)
-- [Handler signatures](#handler-signatures)
-- [Transitions](#transitions)
-- [Visualizing workflows](#visualizing-workflows)
-- [Effects](#effects)
-- [Transactions and consistency](#transactions-and-consistency)
+- [The model](#the-model)
+- [Defining behavior](#defining-behavior)
+- [States and transitions](#states-and-transitions)
+- [Client views](#client-views)
+- [Durable effects](#durable-effects)
+- [Transactions](#transactions)
 - [Persistence](#persistence)
 - [Idempotency](#idempotency)
+- [Cancellation](#cancellation)
+- [Visualizing workflows](#visualizing-workflows)
 - [Observability](#observability)
-- [What Trail is not](#what-trail-is-not)
 - [Production checklist](#production-checklist)
 - [License](#license)
-
----
 
 ## Install
 
@@ -38,61 +30,52 @@ Your application works with structs. Your database stores snapshots. Trail keeps
 go get github.com/foxhq/trail
 ```
 
+Trail requires Go 1.27 or later.
+
 ## A workflow in 30 seconds
 
 ```go
 type VerifyData struct {
-	UserID string
-	Code   string
+	CodeHash string
 }
 
-type VerifyInput struct {
-	Code string
-}
+type VerifyInput struct{ CodeHash string }
+type SubmitCode struct{ Code string }
 
-type SubmitCode struct {
-	Code string
-}
-
-func (SubmitCode) Type() trail.ActionType {
-	return "submit_code"
-}
+func (SubmitCode) Type() trail.ActionType { return "submit_code" }
 
 spec := trail.Define(
 	trail.FlowType("verify_email"),
 	func(ctx context.Context, begin trail.BeginContext, input VerifyInput) (*trail.Transition[VerifyData], error) {
-		return trail.To("waiting_for_code", VerifyData{
-			UserID: string(begin.SubjectID),
-			Code:   input.Code,
-		}), nil
+		return trail.To("waiting_for_code", VerifyData{CodeHash: input.CodeHash}).
+			WithView(map[string]string{"screen": "enter_code"}), nil
 	},
 )
 
-trail.Start(spec).MustGoTo("waiting_for_code")
+spec.Start().MustGoTo("waiting_for_code")
 
-trail.When(spec, "waiting_for_code", func(
+spec.When("waiting_for_code", func(
 	ctx context.Context,
 	data VerifyData,
 	action SubmitCode,
 ) (*trail.Transition[VerifyData], error) {
-	if action.Code != data.Code {
+	if !codes.Match(data.CodeHash, action.Code) {
 		return trail.To("waiting_for_code", data), nil
 	}
 	return trail.Done("verified", data), nil
 }).MustGoTo("waiting_for_code", "verified")
 
 registry := trail.NewRegistry()
-_ = trail.Register(registry, spec)
+if err := trail.Register(registry, spec); err != nil {
+	return err
+}
 
-engine := trail.NewEngine(
-	trail.NewMemoryStore(),
-	registry,
-)
+engine := trail.NewEngine(store, registry)
 
 started, err := engine.Begin(ctx, trail.BeginRequest{
 	Type:      "verify_email",
 	SubjectID: "user_123",
-	Input:     VerifyInput{Code: "123456"},
+	Input:     VerifyInput{CodeHash: hash},
 })
 
 done, err := engine.Submit(ctx, trail.SubmitRequest{
@@ -101,50 +84,19 @@ done, err := engine.Submit(ctx, trail.SubmitRequest{
 })
 ```
 
-That is the whole loop:
+## The model
 
-```text
-Begin(input) -> typed data + state
-Submit(action) -> typed handler -> typed transition
-Store -> durable snapshot
-Result -> application response
-```
+Trail separates three things that are often accidentally mixed together:
 
-## Why Trail exists
+- `Flow[D]` is private, typed state for the workflow implementation. It can hold hashes, counters, internal IDs, and decision data.
+- `Result.View` is a persisted, client-safe JSON document. It is the current screen or public representation of the flow.
+- `Effect` is a durable intent for work outside the transaction, such as an email, webhook, job, or integration event.
 
-Most workflow code starts clean and then slowly becomes this:
+`Result` deliberately does not include the subject, metadata, private data, or effect payloads. Those values stay inside trusted application code.
 
-- one table storing arbitrary JSON
-- one state field
-- one action field
-- many `switch` statements
-- repeated `json.Unmarshal`
-- runtime type assertions
-- hidden side effects
-- no clear transition graph
+## Defining behavior
 
-Trail keeps the good part of finite state machines and removes the ceremony.
-
-You define:
-
-- the data type for the flow
-- the begin input type
-- the action types
-- the allowed state transitions
-- the side effects that should happen after commit
-
-Trail handles:
-
-- persistence snapshots
-- typed handler dispatch
-- optimistic concurrency
-- idempotency
-- lifecycle events
-- effect dispatch
-
-## Define behavior on structs
-
-Small flows can use inline functions. Larger flows usually read better as structs.
+For a small flow, an inline begin function is ideal. For a larger flow, put behavior on a struct with its dependencies:
 
 ```go
 type VerifyEmailFlow struct {
@@ -156,15 +108,7 @@ func (f VerifyEmailFlow) Begin(
 	begin trail.BeginContext,
 	input VerifyInput,
 ) (*trail.Transition[VerifyData], error) {
-	code := f.codes.New()
-
-	return trail.To("waiting_for_code", VerifyData{
-		UserID: string(begin.SubjectID),
-		Code:   f.codes.Hash(code),
-	}).WithEffects(SendVerificationEmail{
-		UserID: string(begin.SubjectID),
-		Code:   code,
-	}), nil
+	return trail.To("waiting_for_code", VerifyData{CodeHash: input.CodeHash}), nil
 }
 
 func (f VerifyEmailFlow) SubmitCode(
@@ -172,311 +116,203 @@ func (f VerifyEmailFlow) SubmitCode(
 	data VerifyData,
 	action SubmitCode,
 ) (*trail.Transition[VerifyData], error) {
-	if !f.codes.Check(data.Code, action.Code) {
+	if !f.codes.Match(data.CodeHash, action.Code) {
 		return trail.To("waiting_for_code", data), nil
 	}
 	return trail.Done("verified", data), nil
 }
 
 flow := VerifyEmailFlow{codes: codes}
+spec := trail.Define("verify_email", flow.Begin)
 
-spec := trail.Define(trail.FlowType("verify_email"), flow.Begin)
-
-trail.Start(spec).MustGoTo("waiting_for_code")
-trail.When(spec, "waiting_for_code", flow.SubmitCode).
+spec.Start().MustGoTo("waiting_for_code")
+spec.When("waiting_for_code", flow.SubmitCode).
 	MustGoTo("waiting_for_code", "verified")
 ```
 
-Read the setup as plain English:
+`When` is for handlers that only need `D`. `WhenFlow` is for the occasional handler that genuinely needs flow metadata such as `ID`, `SubjectID`, `Revision`, or `ExpiresAt`:
 
 ```go
-trail.Start(spec).MustGoTo("waiting_for_code")
-
-trail.When(spec, "waiting_for_code", flow.SubmitCode).
-	MustGoTo("waiting_for_code", "verified")
-```
-
-Start here. When this action happens here, run this method. These are the only states it may return.
-
-## Handler signatures
-
-Begin handlers receive the begin context and typed input:
-
-```go
-func(
-	ctx context.Context,
-	begin trail.BeginContext,
-	input VerifyInput,
-) (*trail.Transition[VerifyData], error)
-```
-
-Action handlers usually only need typed data and typed action:
-
-```go
-func(
-	ctx context.Context,
-	data VerifyData,
-	action SubmitCode,
-) (*trail.Transition[VerifyData], error)
-```
-
-If a handler needs flow metadata, use `WhenFlow`:
-
-```go
-trail.WhenFlow(spec, "waiting_for_code", flow.SubmitCodeWithFlow).
-	MustGoTo("waiting_for_code", "verified")
-
-func (f VerifyEmailFlow) SubmitCodeWithFlow(
+spec.WhenFlow("waiting_for_code", func(
 	ctx context.Context,
 	flow *trail.Flow[VerifyData],
 	action SubmitCode,
 ) (*trail.Transition[VerifyData], error) {
-	// flow has ID, Type, SubjectID, State, Metadata, Revision, ExpiresAt, etc.
 	return trail.To(flow.State, flow.Data), nil
+}).MustGoTo("waiting_for_code")
+```
+
+The action type is inferred from the handler. Trail does not use reflection-based registration, so an incompatible handler fails to compile.
+
+Definitions are sealed when registered. Finish configuring a `Definition` before calling `Register`.
+
+## States and transitions
+
+Each declaration does two jobs: it registers a typed handler and declares exactly where that handler may lead.
+
+```go
+spec.When("waiting_for_code", flow.SubmitCode).
+	MustGoTo("waiting_for_code", "verified", "locked")
+```
+
+The same action type may be used in multiple states. Trail dispatches by `(current state, action type)`, so a `continue` action can correctly mean one thing in a setup step and another in a review step. `AnyState` is available for an intentional fallback.
+
+Use `trail.To(state, data)` for an active flow and `trail.Done(state, data)` for a completed one. The engine validates returned state edges against the declared graph.
+
+## Client views
+
+Attach a complete public view when a transition changes what a client should render:
+
+```go
+type VerifyView struct {
+	Screen        string    `json:"screen"`
+	CanResendAt   time.Time `json:"canResendAt"`
+	AllowedAction []string  `json:"allowedActions"`
 }
+
+return trail.To("waiting_for_code", data).WithView(VerifyView{
+	Screen:        "enter_code",
+	CanResendAt:   data.ResendAfter,
+	AllowedAction: []string{"submit_code", "resend_code"},
+}), nil
 ```
 
-Use `When` by default. Reach for `WhenFlow` only when the flow metadata matters.
+Views are full replacements:
 
-## Transitions
+- no `WithView` call retains the prior view;
+- `WithView(next)` replaces it atomically;
+- `ClearView()` removes it.
 
-Handlers return transitions:
+Trail never patches or merges a view. A transport boundary can decode it once into the response type it owns:
 
 ```go
-return trail.To("waiting_for_code", data), nil
+view, err := trail.ViewAs[VerifyView](result)
 ```
 
-or completed transitions:
+This keeps data serialization at the persistence/API boundary, not inside every state handler.
 
-```go
-return trail.Done("verified", data), nil
-```
+## Durable effects
 
-Transitions can expose public response data without changing persisted flow data:
-
-```go
-return trail.To("waiting_for_code", data).
-	WithPublic(map[string]any{
-		"resendAfter": data.ResendAfter,
-	}), nil
-```
-
-And they can emit effects:
-
-```go
-return trail.Done("verified", data).
-	WithEffects(SendVerificationEmail{UserID: data.UserID, Code: data.Code}), nil
-```
-
-## Visualizing workflows
-
-Trail can turn declared transitions into a neutral graph model:
-
-```go
-graph, err := trail.GraphOf(spec)
-```
-
-or for every spec registered in a registry:
-
-```go
-graph, err := trail.GraphOfRegistry(registry)
-```
-
-Render it as Mermaid for docs, PRs, or CI artifacts:
-
-```go
-diagram := trail.Mermaid(graph)
-fmt.Println(diagram)
-```
-
-Example output:
-
-```mermaid
-stateDiagram-v2
-    state "waiting_for_code" as waiting_for_code
-    state "verified" as verified
-    [*] --> waiting_for_code
-    waiting_for_code --> waiting_for_code: submit_code
-    waiting_for_code --> verified: submit_code
-```
-
-Keep this as developer tooling. Your production runtime does not need to serve diagrams. A clean pattern is a tiny command that builds the same registry your app uses and prints a graph:
-
-```go
-func main() {
-	registry := buildWorkflowRegistry()
-
-	graph, err := trail.GraphOfRegistry(registry)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Print(trail.Mermaid(graph))
-}
-```
-
-Then use it in docs or CI:
-
-```sh
-go run ./cmd/workflowviz > docs/workflows.mmd
-```
-
-The important part: the diagram comes from the same `Start(...).MustGoTo(...)` and `When(...).MustGoTo(...)` declarations the engine uses. No duplicated diagram config.
-
-## Effects
-
-Effects are how workflow code says, “this transition also produced work for the outside world.”
-
-Use effects for:
-
-- sending emails
-- publishing webhooks
-- enqueueing jobs
-- writing audit records
-- notifying another service
-
-Do not send irreversible side effects directly inside workflow handlers. If the email succeeds but the snapshot fails to save, your system has already diverged.
+An effect is an intent to do work after a successful commit.
 
 ```go
 type SendVerificationEmail struct {
-	UserID string
-	Code   string
+	Address string
+	Code    string
 }
 
 func (SendVerificationEmail) Type() trail.EffectType {
 	return "send_verification_email"
 }
+
+return trail.To("waiting_for_code", data).
+	WithEffects(SendVerificationEmail{Address: address, Code: code}), nil
 ```
 
-For small services, register handlers with an in-process effect router:
+The engine never sends mail, calls a webhook, or publishes a message itself. If a transition emits effects, it requires both a configured `UnitOfWork` and `EffectRecorder`; otherwise it fails before persisting the transition.
 
-```go
-router := trail.NewEffectRouter(
-	trail.OnEffect(func(ctx context.Context, effect SendVerificationEmail) error {
-		return mailer.SendVerificationCode(ctx, effect.UserID, effect.Code)
-	}),
-)
-
-if err := router.Validate(); err != nil {
-	return err
-}
-```
-
-Or use the fluent style:
-
-```go
-router := trail.NewEffectRouter().
-	OnEffect(func(ctx context.Context, effect SendVerificationEmail) error {
-		return mailer.SendVerificationCode(ctx, effect.UserID, effect.Code)
-	})
-```
-
-Both styles are supported.
-
-Package-level `trail.OnEffect(...)` gives compile-time generic checking. Fluent `router.OnEffect(...)` validates handler shape at setup/runtime because Go methods cannot declare their own type parameters.
-
-If an effect needs the committed result, use `OnEffectWithResult`:
-
-```go
-router := trail.NewEffectRouter(
-	trail.OnEffectWithResult(func(
-		ctx context.Context,
-		result trail.Result,
-		effect SendVerificationEmail,
-	) error {
-		return audit.RecordEmailIntent(ctx, result.ID, effect.UserID)
-	}),
-)
-```
-
-Register the router with the engine:
-
-```go
-engine := trail.NewEngine(
-	store,
-	registry,
-	trail.WithEffectSink(router),
-)
-```
-
-For production systems, prefer an application-owned `EffectSink` that writes to your existing outbox, event table, message bus, or job queue. Trail does not own that infrastructure; it only calls your sink with the typed effects produced by the flow.
-
-## Transactions and consistency
-
-Trail exposes a small transaction boundary:
-
-```go
-type UnitOfWork interface {
-	Do(ctx context.Context, fn func(ctx context.Context) error) error
-}
-```
-
-When configured, `Begin`, `Submit`, and `Cancel` run inside that boundary. The same context is passed to:
-
-- the Trail store
-- the flow handler
-- your application repositories used by the handler
-- the effect sink
-- the idempotency store
-
-That lets the application decide what “atomic” means:
+The recorder writes an outbox row, job, or event record using the same transaction context as the flow snapshot:
 
 ```go
 engine := trail.NewEngine(
 	store,
 	registry,
 	trail.WithUnitOfWork(appTx),
-	trail.WithEffectSink(appOutbox),
+	trail.WithEffectRecorder(trail.EffectRecorderFunc(func(
+		ctx context.Context,
+		flow trail.EffectContext,
+		effects []trail.Effect,
+	) error {
+		return outbox.Record(ctx, flow, effects)
+	})),
 )
 ```
 
-The clean production pattern is:
+After commit, a worker dispatches a recorded item with an `EffectRouter`:
 
-- mutate domain entities immediately inside the handler or service it calls
-- return effects only for external work such as email, SMS, webhooks, jobs, or integration events
-- make the `EffectSink` persist those effect intents to the app’s existing outbox inside the same transaction
-- let workers deliver the outbox asynchronously
+```go
+router := trail.NewEffectRouter().
+	OnEffect(func(ctx context.Context, effect SendVerificationEmail) error {
+		return mailer.Send(ctx, effect.Address, effect.Code)
+	})
+if err := router.Validate(); err != nil {
+	return err
+}
 
-If `EffectSink.Publish` fails, Trail returns `ErrEffectPublishFailed`. With a transactional `UnitOfWork`, the transaction can roll back the flow snapshot, domain writes, idempotency write, and outbox write together. With the default `NoopUnitOfWork`, there is no rollback boundary; use that only when this tradeoff is acceptable.
+// In the worker, after loading an outbox record:
+err := router.Dispatch(ctx, record.Flow, record.Effects)
+```
+
+`OnEffect` and `OnEffectWithContext` are compile-time typed. The constructor form—`trail.NewEffectRouter(trail.OnEffect(...))`—remains available when it reads better. `EffectContext` identifies the flow revision that produced an effect and is provided only to trusted recorder/worker code.
+
+Registration, validation, and dispatch are concurrency-safe. Each `Dispatch` call uses one validated snapshot of the handler table, so a concurrently added route applies only to later dispatches. Call `router.Seal()` after startup configuration to freeze the table; it validates the configuration and rejects later registration. Because fluent registration cannot return an error, a registration attempted after sealing is reported by `Validate` and `Dispatch` as a configuration error.
+
+An `EffectRouter` can also sit behind an `EffectRecorder` when every registered handler only creates another transaction-bound durable record (for example, a job table). It must never be used there for SMTP, HTTP, or broker delivery.
+
+## Transactions
+
+The engine invokes the store, flow handlers, domain repositories, idempotency store, and effect recorder inside one application-owned boundary:
+
+```go
+type UnitOfWork interface {
+	Do(ctx context.Context, fn func(context.Context) error) error
+}
+```
+
+Use it to mutate domain entities immediately while returning effects only for external work:
+
+```text
+request
+  └─ transaction
+       ├─ handler changes domain entities
+       ├─ Trail writes the next flow snapshot
+       ├─ recorder writes outbox/job intent
+       └─ commit
+             └─ worker dispatches email/webhook/event
+```
+
+This is compatible with an existing outbox or message platform. Trail owns neither; it only enforces that it receives a transaction-bound recorder for effectful transitions.
 
 ## Persistence
 
-Trail storage is intentionally small:
+Trail stores `Snapshot` values. A store assigns the committed revision and returns the committed snapshot, avoiding a second read after every write:
 
 ```go
 type Store interface {
-	Create(context.Context, trail.Snapshot) error
+	Create(context.Context, trail.Snapshot) (trail.Snapshot, error)
 	Get(context.Context, trail.FlowID) (trail.Snapshot, error)
-	Update(context.Context, trail.Snapshot) error
+	Update(context.Context, trail.Snapshot) (trail.Snapshot, error)
 	Delete(context.Context, trail.FlowID) error
 }
 ```
 
-`Update` must use optimistic concurrency with `Snapshot.Revision`. If the incoming revision is stale, return `trail.ErrFlowConflict`.
+`Update` must compare the supplied `Snapshot.Revision` and return `trail.ErrFlowConflict` for a stale write. `MemoryStore` is useful for tests and local development; production stores normally implement the same compare-and-swap condition in SQL.
 
-Optional extensions:
+`QueryStore` and `CleanupStore` are optional interfaces for operational listing and retention cleanup.
 
-- `QueryStore` for dashboards, jobs, and operational tooling
-- `CleanupStore` for retention cleanup
-- `IdempotencyStore` for safe retries
+The `trail/storetest` package provides a reusable contract suite for adapters:
 
-The store only sees snapshots. Your handlers only see typed data.
+```go
+func TestPostgresStoreContract(t *testing.T) {
+	storetest.Contract(t, func(t testing.TB) trail.Store {
+		return newIsolatedPostgresStore(t)
+	})
+}
+```
+
+Data versioning belongs to the codec. `Define` starts with a safe version-one JSON codec that rejects another stored version. When data evolves, supply a `Codec[D]` that explicitly decodes or migrates every historical version you retain.
 
 ## Idempotency
 
-For APIs that may be retried, configure an idempotency store:
+For retryable public requests, configure an `IdempotencyStore`:
 
 ```go
 engine := trail.NewEngine(
 	store,
 	registry,
-	trail.WithIdempotencyStore(trail.NewMemoryIdempotencyStore()),
+	trail.WithIdempotencyStore(idempotencyStore),
 )
-```
 
-Then pass idempotency keys on begin or submit requests:
-
-```go
 result, err := engine.Submit(ctx, trail.SubmitRequest{
 	FlowID:         flowID,
 	Action:         SubmitCode{Code: "123456"},
@@ -484,92 +320,87 @@ result, err := engine.Submit(ctx, trail.SubmitRequest{
 })
 ```
 
+Trail atomically reserves the key. A completed matching request replays its safe `Result`; a concurrent matching request returns `ErrIdempotencyInProgress`; a different request under the same key returns `ErrIdempotencyKeyReuse`.
+
+By default Trail fingerprints JSON-serializable request input. Set `IdempotencyFingerprint` yourself when the input/action is not JSON-serializable or when your API already has a canonical request hash. Your production idempotency implementation must use the same transaction as the flow store.
+
+## Cancellation
+
+Every active flow can use standard cancellation:
+
+```go
+result, err := engine.Cancel(ctx, trail.CancelRequest{
+	FlowID: flowID,
+	Reason: "user_cancelled",
+})
+```
+
+For flows that must release a reservation, clear a challenge, change the view, or emit an effect during cancellation, declare typed state-specific behavior:
+
+```go
+spec.WhenCancel("awaiting_approval", func(
+	ctx context.Context,
+	flow *trail.Flow[ApprovalData],
+	cancel trail.CancelContext,
+) (*trail.Transition[ApprovalData], error) {
+	return trail.To("cancelled", release(flow.Data)).
+		WithView(ApprovalView{Status: "cancelled"}), nil
+}).MustGoTo("cancelled")
+```
+
+Trail validates the declared cancellation edge and marks the resulting flow `Completed` and `Cancelled`.
+
+## Visualizing workflows
+
+Trail can export the transitions already declared in source code. Keep that as developer tooling, not a production endpoint:
+
+```go
+graph, err := trail.GraphOfRegistry(registry)
+if err != nil {
+	return err
+}
+fmt.Print(trail.Mermaid(graph))
+```
+
+For example, a small command can build the app registry and write a Mermaid artifact during CI:
+
+```sh
+go run ./cmd/workflowviz > docs/workflows.mmd
+```
+
+The diagram comes from the same `Start`, `When`, and `WhenCancel` declarations that the engine enforces. There is no separate visualization configuration to drift.
+
 ## Observability
 
-Observers receive lifecycle events without changing workflow behavior:
+Observers receive lifecycle events for metrics, logs, and tracing:
 
 ```go
 observer := trail.ObserverFunc(func(ctx context.Context, event trail.Event) {
 	logger.Info("trail event",
 		"name", event.Name,
-		"flowId", event.Flow.ID,
+		"flow_id", event.Flow.ID,
 		"type", event.Flow.Type,
 		"state", event.Flow.State,
 		"action", event.Action,
 		"error", event.Error,
 	)
 })
-
-engine := trail.NewEngine(
-	store,
-	registry,
-	trail.WithObserver(observer),
-)
 ```
 
-Observers are for logs, metrics, tracing, and lightweight audit trails. They should not contain business logic and they should not be required for correctness.
-
-Available event names:
-
-- `EventBeginStarted`
-- `EventBeginCompleted`
-- `EventBeginFailed`
-- `EventSubmitStarted`
-- `EventSubmitCompleted`
-- `EventSubmitFailed`
-- `EventCancelStarted`
-- `EventCancelCompleted`
-- `EventCancelFailed`
-- `EventEffectPublished`
-- `EventEffectPublishFailed`
-
-Observer failures must be handled inside the observer. Trail recovers observer panics so observability code does not break flow execution.
-
-For metrics:
-
-```go
-observer := trail.ObserverFunc(func(ctx context.Context, event trail.Event) {
-	metrics.Count("trail.event", 1,
-		"event", string(event.Name),
-		"type", string(event.Flow.Type),
-		"state", string(event.Flow.State),
-	)
-})
-```
-
-For tracing:
-
-```go
-observer := trail.ObserverFunc(func(ctx context.Context, event trail.Event) {
-	span := trace.SpanFromContext(ctx)
-	span.AddEvent("trail."+string(event.Name), trace.WithAttributes(
-		attribute.String("trail.flow_id", string(event.Flow.ID)),
-		attribute.String("trail.flow_type", string(event.Flow.Type)),
-		attribute.String("trail.state", string(event.Flow.State)),
-		attribute.String("trail.action", string(event.Action)),
-	))
-})
-```
-
-## What Trail is not
-
-Trail is not a BPMN engine. It is not a distributed saga framework. It is not a visual workflow builder.
-
-Trail is for application workflows where Go code is the source of truth and the database stores durable progress.
-
-That constraint is deliberate. It keeps the library small, predictable, and easy to reason about.
+Observer events carry the same client-safe `Result` shape as the engine. They never contain private data, subject IDs, metadata, or effect payloads. Events are delivered synchronously, in lifecycle order, after the unit of work has returned. Observers must handle their own errors; Trail recovers observer panics. They cannot affect the flow or hold its transaction open, although slow observers still add request latency.
 
 ## Production checklist
 
-- Use a real `Store` backed by your database.
-- Implement `Update` with compare-and-swap revision checks.
-- Use `IdempotencyStore` for public APIs.
-- Use effects instead of direct side effects inside handlers.
-- Use `WithUnitOfWork` when Trail participates in application transactions.
-- Prefer an application outbox or durable event sink for important effects.
-- Call `router.Validate()` during startup when using an `EffectRouter`.
-- Keep persisted flow data serializable and versioned.
+- Finish and register definitions before serving requests.
+- Back `Store.Update` with optimistic compare-and-swap revisions.
+- Keep private flow data serializable and create an explicit codec migration before changing its version.
+- Use `WithUnitOfWork` and a transactional `EffectRecorder` for any flow that emits effects.
+- Dispatch effects from an outbox/job worker after commit, never from a request handler.
+- Use idempotency for retryable public writes and store it in the same transaction as the flow.
+- Return complete client-safe views; decode them with `ViewAs` at the API boundary.
+- Call `router.Seal()` during startup when the effect routes should remain immutable, or `router.Validate()` when runtime route registration is intentional.
+- Generate graphs in development or CI to review real transition declarations.
 
 ## License
 
-MIT © 2026 Manifox Technology Solutions Co., Ltd.
+MIT © 2026 Phuc Tran, Manifox Technology Solutions Co., Ltd.

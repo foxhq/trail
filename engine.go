@@ -3,12 +3,16 @@ package trail
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 )
 
-// Engine coordinates specs, storage, idempotency, effects, and lifecycle events.
+// Engine coordinates specs, storage, idempotency, durable effects, and
+// lifecycle events.
 type Engine interface {
 	Begin(ctx context.Context, req BeginRequest) (Result, error)
 	Submit(ctx context.Context, req SubmitRequest) (Result, error)
@@ -17,20 +21,14 @@ type Engine interface {
 }
 
 // Clock supplies engine time.
-type Clock interface {
-	Now() time.Time
-}
+type Clock interface{ Now() time.Time }
 
 type realClock struct{}
 
-func (realClock) Now() time.Time {
-	return time.Now().UTC()
-}
+func (realClock) Now() time.Time { return time.Now().UTC() }
 
 // IDGenerator supplies new flow IDs.
-type IDGenerator interface {
-	NextFlowID() (FlowID, error)
-}
+type IDGenerator interface{ NextFlowID() (FlowID, error) }
 
 type randomIDGenerator struct{}
 
@@ -43,15 +41,10 @@ func (randomIDGenerator) NextFlowID() (FlowID, error) {
 }
 
 // EngineOption configures an Engine.
-type EngineOption interface {
-	apply(*engine)
-}
-
+type EngineOption interface{ apply(*engine) }
 type engineOptionFunc func(*engine)
 
-func (f engineOptionFunc) apply(e *engine) {
-	f(e)
-}
+func (f engineOptionFunc) apply(e *engine) { f(e) }
 
 // WithClock sets the engine clock.
 func WithClock(clock Clock) EngineOption {
@@ -72,29 +65,25 @@ func WithIDGenerator(generator IDGenerator) EngineOption {
 }
 
 // WithUnitOfWork sets the transaction or consistency boundary used by Begin,
-// Submit, and Cancel.
+// Submit, and Cancel. It is mandatory when transitions record effects.
 func WithUnitOfWork(unitOfWork UnitOfWork) EngineOption {
 	return engineOptionFunc(func(e *engine) {
 		if unitOfWork != nil {
 			e.unitOfWork = unitOfWork
+			e.hasUnitOfWork = true
 		}
 	})
 }
 
-// WithEffectSink sets the sink that publishes effects returned by specs.
-func WithEffectSink(sink EffectSink) EngineOption {
-	return engineOptionFunc(func(e *engine) {
-		if sink != nil {
-			e.effects = sink
-		}
-	})
+// WithEffectRecorder sets the transactional outbox or job-intent recorder.
+// Trail never dispatches effects from the request path.
+func WithEffectRecorder(recorder EffectRecorder) EngineOption {
+	return engineOptionFunc(func(e *engine) { e.effectRecorder = recorder })
 }
 
-// WithIdempotencyStore sets the idempotency result store.
+// WithIdempotencyStore sets the atomically reserving idempotency store.
 func WithIdempotencyStore(store IdempotencyStore) EngineOption {
-	return engineOptionFunc(func(e *engine) {
-		e.idempotency = store
-	})
+	return engineOptionFunc(func(e *engine) { e.idempotency = store })
 }
 
 // WithObserver registers a lifecycle observer.
@@ -107,26 +96,20 @@ func WithObserver(observer Observer) EngineOption {
 }
 
 type engine struct {
-	store       Store
-	registry    *SpecRegistry
-	clock       Clock
-	idgen       IDGenerator
-	unitOfWork  UnitOfWork
-	effects     EffectSink
-	idempotency IdempotencyStore
-	observers   []Observer
+	store          Store
+	registry       *SpecRegistry
+	clock          Clock
+	idgen          IDGenerator
+	unitOfWork     UnitOfWork
+	hasUnitOfWork  bool
+	effectRecorder EffectRecorder
+	idempotency    IdempotencyStore
+	observers      []Observer
 }
 
 // NewEngine creates an engine for a snapshot store and spec registry.
 func NewEngine(store Store, registry *SpecRegistry, opts ...EngineOption) Engine {
-	e := &engine{
-		store:      store,
-		registry:   registry,
-		clock:      realClock{},
-		idgen:      randomIDGenerator{},
-		unitOfWork: NoopUnitOfWork{},
-		effects:    NoopEffectSink{},
-	}
+	e := &engine{store: store, registry: registry, clock: realClock{}, idgen: randomIDGenerator{}, unitOfWork: NoopUnitOfWork{}}
 	for _, opt := range opts {
 		if opt != nil {
 			opt.apply(e)
@@ -142,82 +125,73 @@ func (e *engine) Begin(ctx context.Context, req BeginRequest) (result Result, er
 	if req.Type == "" {
 		return Result{}, fmt.Errorf("%w: begin type is empty", ErrInvalidFlow)
 	}
-
-	startEvent := Event{
-		Name: EventBeginStarted,
-		Flow: Result{
-			Type:      req.Type,
-			SubjectID: req.SubjectID,
-			ExpiresAt: req.ExpiresAt,
-			Metadata:  cloneStringMap(req.Metadata),
-		},
-	}
-	e.observe(ctx, startEvent)
+	events := []Event{{Name: EventBeginStarted, Flow: Result{Type: req.Type, ExpiresAt: req.ExpiresAt}}}
 	defer func() {
 		if err != nil {
-			e.observe(ctx, Event{Name: EventBeginFailed, Flow: result, Error: err})
+			events = append(events, Event{Name: EventBeginFailed, Flow: result, Error: err})
+		}
+		for _, event := range events {
+			e.observe(ctx, event)
 		}
 	}()
 
-	var effects []Effect
+	var recordedEffects bool
 	err = e.unitOfWork.Do(ctx, func(ctx context.Context) error {
-		idemKey := scopedIdempotencyKey("begin:"+string(req.Type), req.IdempotencyKey)
-		if e.idempotency != nil && idemKey != "" {
-			stored, ok, err := e.idempotency.Get(ctx, idemKey)
-			if err != nil || ok {
-				result = stored
-				return err
-			}
+		reservation, replay, err := e.reserveBegin(ctx, req)
+		if err != nil {
+			return err
 		}
+		if replay != nil {
+			result = *replay
+			return nil
+		}
+		completed := false
+		defer func() {
+			if reservation != nil && !completed {
+				_ = e.idempotency.Abort(ctx, reservation)
+			}
+		}()
 
 		spec, ok := e.registry.get(req.Type)
 		if !ok {
 			return fmt.Errorf("%w: %s", ErrSpecNotFound, req.Type)
 		}
-
 		id, err := e.idgen.NextFlowID()
 		if err != nil {
 			return err
 		}
-		now := e.clock.Now()
-
-		snap, nextResult, nextEffects, err := spec.begin(ctx, id, req, now)
+		snapshot, effects, err := spec.begin(ctx, id, req, e.clock.Now())
 		if err != nil {
 			return err
 		}
-		if err := e.store.Create(ctx, *snap); err != nil {
+		if err := e.validateEffects(effects); err != nil {
 			return err
 		}
-
-		created, err := e.store.Get(ctx, snap.ID)
+		committed, err := e.store.Create(ctx, *snapshot)
 		if err != nil {
 			return err
 		}
-		nextResult.Revision = created.Revision
-		result = nextResult
-		effects = nextEffects
-
-		if len(nextEffects) > 0 {
-			if err := e.effects.Publish(ctx, nextResult, nextEffects); err != nil {
-				err = fmt.Errorf("%w: %v", ErrEffectPublishFailed, err)
-				e.observe(ctx, Event{Name: EventEffectPublishFailed, Flow: nextResult, Error: err})
-				return err
-			}
+		result = resultFromSnapshot(committed)
+		if err := e.recordEffects(ctx, committed, effects); err != nil {
+			events = append(events, Event{Name: EventEffectRecordFailed, Flow: result, Error: err})
+			return err
 		}
-		if e.idempotency != nil && idemKey != "" {
-			if err := e.idempotency.Put(ctx, idemKey, nextResult); err != nil {
+		recordedEffects = len(effects) > 0
+		if reservation != nil {
+			if err := e.idempotency.Complete(ctx, reservation, result); err != nil {
 				return err
 			}
+			completed = true
 		}
 		return nil
 	})
 	if err != nil {
 		return result, err
 	}
-	if len(effects) > 0 {
-		e.observe(ctx, Event{Name: EventEffectPublished, Flow: result})
+	if recordedEffects {
+		events = append(events, Event{Name: EventEffectRecorded, Flow: result})
 	}
-	e.observe(ctx, Event{Name: EventBeginCompleted, Flow: result})
+	events = append(events, Event{Name: EventBeginCompleted, Flow: result})
 	return result, nil
 }
 
@@ -231,87 +205,84 @@ func (e *engine) Submit(ctx context.Context, req SubmitRequest) (result Result, 
 	if req.Action == nil {
 		return Result{}, fmt.Errorf("%w: submit action is nil", ErrUnsupportedAction)
 	}
-
 	actionType := req.Action.Type()
-	e.observe(ctx, Event{
-		Name:   EventSubmitStarted,
-		Flow:   Result{ID: req.FlowID},
-		Action: actionType,
-	})
+	events := []Event{{Name: EventSubmitStarted, Flow: Result{ID: req.FlowID}, Action: actionType}}
 	defer func() {
 		if err != nil {
-			e.observe(ctx, Event{Name: EventSubmitFailed, Flow: result, Action: actionType, Error: err})
+			events = append(events, Event{Name: EventSubmitFailed, Flow: result, Action: actionType, Error: err})
+		}
+		for _, event := range events {
+			e.observe(ctx, event)
 		}
 	}()
 
-	var effects []Effect
+	var recordedEffects bool
 	err = e.unitOfWork.Do(ctx, func(ctx context.Context) error {
-		idemKey := scopedIdempotencyKey("submit:"+string(req.FlowID), req.IdempotencyKey)
-		if e.idempotency != nil && idemKey != "" {
-			stored, ok, err := e.idempotency.Get(ctx, idemKey)
-			if err != nil || ok {
-				result = stored
-				return err
-			}
+		reservation, replay, err := e.reserveSubmit(ctx, req)
+		if err != nil {
+			return err
 		}
+		if replay != nil {
+			result = *replay
+			return nil
+		}
+		completed := false
+		defer func() {
+			if reservation != nil && !completed {
+				_ = e.idempotency.Abort(ctx, reservation)
+			}
+		}()
 
-		snap, err := e.store.Get(ctx, req.FlowID)
+		snapshot, err := e.store.Get(ctx, req.FlowID)
 		if err != nil {
 			return err
 		}
 		now := e.clock.Now()
-		if snap.Cancelled {
+		if snapshot.Cancelled {
 			return ErrFlowCancelled
 		}
-		if snap.Completed {
+		if snapshot.Completed {
 			return ErrFlowCompleted
 		}
-		if snap.IsExpiredAt(now) {
+		if snapshot.IsExpiredAt(now) {
 			return ErrFlowExpired
 		}
-
-		spec, ok := e.registry.get(snap.Type)
+		spec, ok := e.registry.get(snapshot.Type)
 		if !ok {
-			return fmt.Errorf("%w: %s", ErrSpecNotFound, snap.Type)
+			return fmt.Errorf("%w: %s", ErrSpecNotFound, snapshot.Type)
 		}
-
-		next, nextResult, nextEffects, err := spec.submit(ctx, snap, req.Action, now)
+		next, effects, err := spec.submit(ctx, snapshot, req.Action, now)
 		if err != nil {
 			return err
 		}
-		if err := e.store.Update(ctx, *next); err != nil {
+		if err := e.validateEffects(effects); err != nil {
 			return err
 		}
-
-		updated, err := e.store.Get(ctx, next.ID)
+		committed, err := e.store.Update(ctx, *next)
 		if err != nil {
 			return err
 		}
-		nextResult.Revision = updated.Revision
-		result = nextResult
-		effects = nextEffects
-
-		if len(nextEffects) > 0 {
-			if err := e.effects.Publish(ctx, nextResult, nextEffects); err != nil {
-				err = fmt.Errorf("%w: %v", ErrEffectPublishFailed, err)
-				e.observe(ctx, Event{Name: EventEffectPublishFailed, Flow: nextResult, Action: actionType, Error: err})
-				return err
-			}
+		result = resultFromSnapshot(committed)
+		if err := e.recordEffects(ctx, committed, effects); err != nil {
+			events = append(events, Event{Name: EventEffectRecordFailed, Flow: result, Action: actionType, Error: err})
+			return err
 		}
-		if e.idempotency != nil && idemKey != "" {
-			if err := e.idempotency.Put(ctx, idemKey, nextResult); err != nil {
+		recordedEffects = len(effects) > 0
+		if reservation != nil {
+			if err := e.idempotency.Complete(ctx, reservation, result); err != nil {
 				return err
 			}
+			completed = true
 		}
 		return nil
 	})
 	if err != nil {
 		return result, err
 	}
-	if len(effects) > 0 {
-		e.observe(ctx, Event{Name: EventEffectPublished, Flow: result, Action: actionType})
+	if recordedEffects {
+		events = append(events, Event{Name: EventEffectRecorded, Flow: result, Action: actionType})
 	}
-	e.observe(ctx, Event{Name: EventSubmitCompleted, Flow: result, Action: actionType})
+	events = append(events, Event{Name: EventSubmitCompleted, Flow: result, Action: actionType})
 	return result, nil
 }
 
@@ -322,11 +293,11 @@ func (e *engine) Get(ctx context.Context, id FlowID) (Result, error) {
 	if id == "" {
 		return Result{}, fmt.Errorf("%w: get flow id is empty", ErrInvalidFlow)
 	}
-	snap, err := e.store.Get(ctx, id)
+	snapshot, err := e.store.Get(ctx, id)
 	if err != nil {
 		return Result{}, err
 	}
-	return snap.View(), nil
+	return resultFromSnapshot(snapshot), nil
 }
 
 func (e *engine) Cancel(ctx context.Context, req CancelRequest) (result Result, err error) {
@@ -336,42 +307,83 @@ func (e *engine) Cancel(ctx context.Context, req CancelRequest) (result Result, 
 	if req.FlowID == "" {
 		return Result{}, fmt.Errorf("%w: cancel flow id is empty", ErrInvalidFlow)
 	}
-	e.observe(ctx, Event{Name: EventCancelStarted, Flow: Result{ID: req.FlowID}})
+	events := []Event{{Name: EventCancelStarted, Flow: Result{ID: req.FlowID}}}
 	defer func() {
 		if err != nil {
-			e.observe(ctx, Event{Name: EventCancelFailed, Flow: result, Error: err})
+			events = append(events, Event{Name: EventCancelFailed, Flow: result, Error: err})
+		}
+		for _, event := range events {
+			e.observe(ctx, event)
 		}
 	}()
 
+	var recordedEffects bool
 	err = e.unitOfWork.Do(ctx, func(ctx context.Context) error {
-		snap, err := e.store.Get(ctx, req.FlowID)
+		reservation, replay, err := e.reserveCancel(ctx, req)
 		if err != nil {
 			return err
 		}
-		if snap.Cancelled {
+		if replay != nil {
+			result = *replay
+			return nil
+		}
+		completed := false
+		defer func() {
+			if reservation != nil && !completed {
+				_ = e.idempotency.Abort(ctx, reservation)
+			}
+		}()
+
+		snapshot, err := e.store.Get(ctx, req.FlowID)
+		if err != nil {
+			return err
+		}
+		if snapshot.Cancelled {
 			return ErrFlowCancelled
 		}
-		if snap.Completed {
+		if snapshot.Completed {
 			return ErrFlowCompleted
 		}
-		snap.Cancelled = true
-		snap.Completed = true
-		snap.CancelReason = req.Reason
-		snap.UpdatedAt = e.clock.Now()
-		if err := e.store.Update(ctx, snap); err != nil {
-			return err
+		now := e.clock.Now()
+		if snapshot.IsExpiredAt(now) {
+			return ErrFlowExpired
 		}
-		updated, err := e.store.Get(ctx, req.FlowID)
+		spec, ok := e.registry.get(snapshot.Type)
+		if !ok {
+			return fmt.Errorf("%w: %s", ErrSpecNotFound, snapshot.Type)
+		}
+		next, effects, err := spec.cancel(ctx, snapshot, req, now)
 		if err != nil {
 			return err
 		}
-		result = updated.View()
+		if err := e.validateEffects(effects); err != nil {
+			return err
+		}
+		committed, err := e.store.Update(ctx, *next)
+		if err != nil {
+			return err
+		}
+		result = resultFromSnapshot(committed)
+		if err := e.recordEffects(ctx, committed, effects); err != nil {
+			events = append(events, Event{Name: EventEffectRecordFailed, Flow: result, Error: err})
+			return err
+		}
+		recordedEffects = len(effects) > 0
+		if reservation != nil {
+			if err := e.idempotency.Complete(ctx, reservation, result); err != nil {
+				return err
+			}
+			completed = true
+		}
 		return nil
 	})
 	if err != nil {
 		return result, err
 	}
-	e.observe(ctx, Event{Name: EventCancelCompleted, Flow: result})
+	if recordedEffects {
+		events = append(events, Event{Name: EventEffectRecorded, Flow: result})
+	}
+	events = append(events, Event{Name: EventCancelCompleted, Flow: result})
 	return result, nil
 }
 
@@ -383,6 +395,82 @@ func (e *engine) validate() error {
 		return fmt.Errorf("%w: registry is nil", ErrInvalidFlow)
 	}
 	return nil
+}
+
+func (e *engine) validateEffects(effects []Effect) error {
+	if len(effects) == 0 {
+		return nil
+	}
+	if !e.hasUnitOfWork {
+		return ErrTransactionalEffectsRequired
+	}
+	if e.effectRecorder == nil {
+		return ErrEffectRecorderRequired
+	}
+	for _, effect := range effects {
+		if effect == nil || effect.Type() == "" {
+			return ErrUnsupportedEffect
+		}
+	}
+	return nil
+}
+
+func (e *engine) recordEffects(ctx context.Context, snapshot Snapshot, effects []Effect) error {
+	if len(effects) == 0 {
+		return nil
+	}
+	flow := EffectContext{FlowID: snapshot.ID, FlowType: snapshot.Type, SubjectID: snapshot.SubjectID, State: snapshot.State, Revision: snapshot.Revision}
+	if err := e.effectRecorder.Record(ctx, flow, effects); err != nil {
+		return fmt.Errorf("%w: %v", ErrEffectRecordFailed, err)
+	}
+	return nil
+}
+
+func (e *engine) reserveBegin(ctx context.Context, req BeginRequest) (*IdempotencyReservation, *Result, error) {
+	if e.idempotency == nil || req.IdempotencyKey == "" {
+		return nil, nil, nil
+	}
+	fingerprint, err := idempotencyFingerprint(req.IdempotencyFingerprint, req.Input)
+	if err != nil {
+		return nil, nil, err
+	}
+	return e.idempotency.Reserve(ctx, scopedIdempotencyKey("begin:"+string(req.Type)+":"+string(req.SubjectID), req.IdempotencyKey), fingerprint)
+}
+
+func (e *engine) reserveSubmit(ctx context.Context, req SubmitRequest) (*IdempotencyReservation, *Result, error) {
+	if e.idempotency == nil || req.IdempotencyKey == "" {
+		return nil, nil, nil
+	}
+	fingerprint, err := idempotencyFingerprint(req.IdempotencyFingerprint, req.Action)
+	if err != nil {
+		return nil, nil, err
+	}
+	return e.idempotency.Reserve(ctx, scopedIdempotencyKey("submit:"+string(req.FlowID), req.IdempotencyKey), fingerprint)
+}
+
+func (e *engine) reserveCancel(ctx context.Context, req CancelRequest) (*IdempotencyReservation, *Result, error) {
+	if e.idempotency == nil || req.IdempotencyKey == "" {
+		return nil, nil, nil
+	}
+	fingerprint, err := idempotencyFingerprint(req.IdempotencyFingerprint, struct {
+		Reason string `json:"reason"`
+	}{Reason: req.Reason})
+	if err != nil {
+		return nil, nil, err
+	}
+	return e.idempotency.Reserve(ctx, scopedIdempotencyKey("cancel:"+string(req.FlowID), req.IdempotencyKey), fingerprint)
+}
+
+func idempotencyFingerprint(explicit string, value any) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("%w: set IdempotencyFingerprint for non-JSON request data: %v", ErrInvalidIdempotencyKey, err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func scopedIdempotencyKey(scope string, key IdempotencyKey) IdempotencyKey {
@@ -398,9 +486,7 @@ func (e *engine) observe(ctx context.Context, event Event) {
 			continue
 		}
 		func() {
-			defer func() {
-				_ = recover()
-			}()
+			defer func() { _ = recover() }()
 			observer.Observe(ctx, event)
 		}()
 	}

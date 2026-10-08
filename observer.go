@@ -6,20 +6,21 @@ import "context"
 type EventName string
 
 const (
-	EventBeginStarted        EventName = "begin_started"
-	EventBeginCompleted      EventName = "begin_completed"
-	EventBeginFailed         EventName = "begin_failed"
-	EventSubmitStarted       EventName = "submit_started"
-	EventSubmitCompleted     EventName = "submit_completed"
-	EventSubmitFailed        EventName = "submit_failed"
-	EventCancelStarted       EventName = "cancel_started"
-	EventCancelCompleted     EventName = "cancel_completed"
-	EventCancelFailed        EventName = "cancel_failed"
-	EventEffectPublished     EventName = "effect_published"
-	EventEffectPublishFailed EventName = "effect_publish_failed"
+	EventBeginStarted       EventName = "begin_started"
+	EventBeginCompleted     EventName = "begin_completed"
+	EventBeginFailed        EventName = "begin_failed"
+	EventSubmitStarted      EventName = "submit_started"
+	EventSubmitCompleted    EventName = "submit_completed"
+	EventSubmitFailed       EventName = "submit_failed"
+	EventCancelStarted      EventName = "cancel_started"
+	EventCancelCompleted    EventName = "cancel_completed"
+	EventCancelFailed       EventName = "cancel_failed"
+	EventEffectRecorded     EventName = "effect_recorded"
+	EventEffectRecordFailed EventName = "effect_record_failed"
 )
 
-// Event is sent to observers during engine operations.
+// Event is queued during an engine operation and delivered to observers after
+// its UnitOfWork has returned.
 type Event struct {
 	Name   EventName
 	Flow   Result
@@ -27,8 +28,10 @@ type Event struct {
 	Error  error
 }
 
-// Observer receives lifecycle events. Observer failures must be handled inside
-// the observer; panics are recovered by the engine.
+// Observer receives lifecycle events synchronously after the engine's
+// UnitOfWork has returned. Observers do not return errors and must handle their
+// own failures; the engine recovers panics. Slow observers add request latency
+// but never prolong the UnitOfWork or alter its outcome.
 type Observer interface {
 	Observe(ctx context.Context, event Event)
 }
